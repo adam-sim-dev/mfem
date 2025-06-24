@@ -1,4 +1,4 @@
-// Copyright (c) 2010-2023, Lawrence Livermore National Security, LLC. Produced
+// Copyright (c) 2010-2025, Lawrence Livermore National Security, LLC. Produced
 // at the Lawrence Livermore National Laboratory. All Rights reserved. See files
 // LICENSE and NOTICE for details. LLNL-CODE-806117.
 //
@@ -56,16 +56,15 @@
 //    lor_solvers -m ../../data/amr-quad.mesh -fe h
 //    lor_solvers -m ../../data/amr-quad.mesh -fe n
 //    lor_solvers -m ../../data/amr-quad.mesh -fe r
-//    lor_solvers -m ../../data/amr-quad.mesh -fe l
 //    lor_solvers -m ../../data/star-surf.mesh -fe h
 //    lor_solvers -m ../../data/star-surf.mesh -fe n
 //    lor_solvers -m ../../data/star-surf.mesh -fe r
 //
 // Device sample runs:
-//    lor_solvers -fe h -d cuda
-//    lor_solvers -fe n -d cuda
-//    lor_solvers -fe r -d cuda
-//    lor_solvers -fe l -d cuda
+//  * lor_solvers -fe h -d cuda
+//  * lor_solvers -fe n -d cuda
+//  * lor_solvers -fe r -d cuda
+//  * lor_solvers -fe l -d cuda
 
 #include "mfem.hpp"
 #include <fstream>
@@ -110,7 +109,7 @@ int main(int argc, char *argv[])
    else if (string(fe) == "l") { L2 = true; }
    else { MFEM_ABORT("Bad FE type. Must be 'h', 'n', 'r', or 'l'."); }
 
-   double kappa = (order+1)*(order+1); // Penalty used for DG discretizations
+   real_t kappa = (order+1)*(order+1); // Penalty used for DG discretizations
 
    Mesh mesh(mesh_file, 1, 1);
    const int dim = mesh.Dimension();
@@ -197,7 +196,7 @@ int main(int argc, char *argv[])
 
    if (sdim == dim)
    {
-      double er =
+      real_t er =
          (H1 || L2) ? x.ComputeL2Error(u_coeff) : x.ComputeL2Error(u_vec_coeff);
       cout << "L2 error: " << er << endl;
    }
