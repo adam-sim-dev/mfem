@@ -68,7 +68,7 @@ GridFunction::GridFunction(Mesh *m, std::istream &input)
       Vector::Load(input, fes->GetVSize());
 
       // if the mesh is a legacy (v1.1) NC mesh, it has old vertex ordering
-      if (fes->Nonconforming() &&
+      if (fes->Nonconforming() && fes->GetMesh()->ncmesh &&
           fes->GetMesh()->ncmesh->IsLegacyLoaded())
       {
          LegacyNCReorder();
@@ -1374,6 +1374,50 @@ void GridFunction::GetVectorGradientHat(
    MultAtB(loc_data_mat, dshape, gh);
 }
 
+void GridFunction::GetGradients(const IntegrationRule &ir, Vector &grad,
+                                QVectorLayout ql, MemoryType d_mt) const
+{
+   const FiniteElement &fe = *fes->GetTypicalFE();
+   const int dim  = fe.GetDim();
+   const int vdim = fes->GetVDim();
+   const int NE   = fes->GetNE();
+   const int ND   = fe.GetDof();
+   const int NQ   = ir.GetNPoints();
+
+   MemoryType my_d_mt = (d_mt != MemoryType::DEFAULT) ? d_mt :
+                        Device::GetDeviceMemoryType();
+
+   // ql == QVectorLayout::byNODES :   NQ x VDIM x  DIM x NE
+   // ql == QVectorLayout::byVDIM  : VDIM x  DIM x NQPT x NE
+   grad.SetSize(dim*vdim*NQ*NE, my_d_mt);
+
+   const QuadratureInterpolator &qi = *fes->GetQuadratureInterpolator(ir);
+   qi.SetOutputLayout(ql);
+
+   const bool use_tensor_products = UsesTensorBasis(*fes);
+   qi.DisableTensorProducts(!use_tensor_products);
+   const ElementDofOrdering e_ordering = use_tensor_products ?
+                                         ElementDofOrdering::LEXICOGRAPHIC :
+                                         ElementDofOrdering::NATIVE;
+   const Operator *elem_restr = fes->GetElementRestriction(e_ordering);
+
+   // Pre-compute the geometric factors in order to set the desired MemoryType
+   // they use:
+   fes->GetMesh()->GetGeometricFactors(
+      ir, GeometricFactors::JACOBIANS, my_d_mt);
+
+   if (elem_restr) // currently, always true
+   {
+      Vector f_e(vdim*ND*NE, my_d_mt);
+      elem_restr->Mult(*this, f_e);
+      qi.PhysDerivatives(f_e, grad);
+   }
+   else
+   {
+      qi.PhysDerivatives(*this, grad);
+   }
+}
+
 real_t GridFunction::GetDivergence(ElementTransformation &T) const
 {
    DofTransformation doftrans;
@@ -2624,7 +2668,7 @@ void GridFunction::ProjectBdrCoefficient(Coefficient *coeff[],
    }
    for (int i = 0; i < values_counter.Size(); i++)
    {
-      MFEM_ASSERT(bool(values_counter[i]) == ess_vdofs_marker[i],
+      MFEM_ASSERT(bool(values_counter[i]) == bool(ess_vdofs_marker[i]),
                   "internal error");
    }
 #endif
@@ -4334,7 +4378,7 @@ real_t LSZZErrorEstimator(BilinearFormIntegrator &blfi,  // input
          u.GetSubVector(udofs, ul);
          utrans.InvTransformPrimal(ul);
          Transf = ufes->GetElementTransformation(ielem);
-         FiniteElement *dummy = nullptr;
+         const auto *dummy = ufes->GetFE(ielem);
          blfi.ComputeElementFlux(*ufes->GetFE(ielem), *Transf, ul,
                                  *dummy, fl, with_coeff, ir);
 
@@ -4563,4 +4607,135 @@ GridFunction *Extrude1DGridFunction(Mesh *mesh, Mesh *mesh2d,
    return sol2d;
 }
 
+void GridFunction::GetElementBoundsAtControlPoints(const int elem,
+                                                   const PLBound &plb,
+                                                   Vector &lower, Vector &upper,
+                                                   const int vdim)
+{
+   const FiniteElement *fe = fes->GetFE(elem);
+   int fes_dim  = fes->GetVDim();
+   int rdim  = fe->GetDim();
+
+   const TensorBasisElement *tbe =
+      dynamic_cast<const TensorBasisElement *>(fe);
+   MFEM_VERIFY(tbe != NULL, "TensorBasis FiniteElement expected.");
+   const Array<int> &dof_map = tbe->GetDofMap();
+
+   Vector loc_data;
+   Array<int> dof_idx;
+   fes->GetElementDofs(elem, dof_idx);
+   int ndofs = dof_idx.Size();
+
+   int n_c_pts = std::pow(plb.GetNControlPoints(), rdim);
+   lower.SetSize(n_c_pts*(vdim > 0 ? 1 : fes_dim));
+   upper.SetSize(n_c_pts*(vdim > 0 ? 1 : fes_dim));
+
+   for (int d = 0; d < fes_dim; d++)
+   {
+      if (vdim > 0 && d != vdim-1) { continue; }
+      const int d_off = vdim > 0 ? 0 : d;
+      Array<int> dof_idx_c = dof_idx;
+      Vector lowerT(lower, d_off*n_c_pts, n_c_pts);
+      Vector upperT(upper, d_off*n_c_pts, n_c_pts);
+      fes->DofsToVDofs(vdim > 0 ? vdim-1 : d, dof_idx_c);
+      GetSubVector(dof_idx_c, loc_data);
+      Vector nodal_data;
+      if (dof_map.Size() == 0)
+      {
+         nodal_data.SetDataAndSize(loc_data.GetData(), ndofs);
+      }
+      else
+      {
+         nodal_data.SetSize(ndofs);
+         for (int j = 0; j < ndofs; j++)
+         {
+            nodal_data(j) = loc_data(dof_map[j]);
+         }
+      }
+      plb.GetNDBounds(rdim, nodal_data, lowerT, upperT);
+   }
 }
+
+void GridFunction::GetElementBounds(const int elem, const PLBound &plb,
+                                    Vector &lower, Vector &upper,
+                                    const int vdim)
+{
+   Vector lowerC, upperC;
+   GetElementBoundsAtControlPoints(elem, plb, lowerC, upperC, vdim);
+   const FiniteElement *fe = fes->GetFE(elem);
+   int rdim  = fe->GetDim();
+   int n_c_pts = std::pow(plb.GetNControlPoints(), rdim);
+   int fes_dim  = fes->GetVDim();
+   lower.SetSize((vdim > 0 ? 1 :fes_dim));
+   upper.SetSize((vdim > 0 ? 1 :fes_dim));
+   for (int d = 0; d < fes_dim; d++)
+   {
+      if (vdim > 0 && d != vdim-1) { continue; }
+      const int d_off = vdim > 0 ? 0 : d;
+      Vector lowerT(lowerC, d_off*n_c_pts, n_c_pts);
+      Vector upperT(upperC, d_off*n_c_pts, n_c_pts);
+      lower(d_off) = lowerT.Min();
+      upper(d_off) = upperT.Max();
+   }
+}
+
+void GridFunction::GetElementBounds(const PLBound &plb,
+                                    Vector &lower, Vector &upper,
+                                    const int vdim)
+{
+   int nel  = fes->GetNE();
+   int fes_dim  = fes->GetVDim();
+   lower.SetSize(nel*(vdim > 0 ? 1 :fes_dim));
+   upper.SetSize(nel*(vdim > 0 ? 1 :fes_dim));
+   for (int e = 0; e < nel; e++)
+   {
+      Vector lt, ut;
+      GetElementBounds(e, plb, lt, ut, vdim);
+      for (int d = 0; d < fes_dim ; d++)
+      {
+         if (vdim > 0 && d != vdim-1) { continue; }
+         const int d_off = vdim > 0 ? 0 : d;
+         lower(e + d_off*nel) = lt(d_off);
+         upper(e + d_off*nel) = ut(d_off);
+      }
+   }
+}
+
+PLBound GridFunction::GetElementBounds(Vector &lower,
+                                       Vector &upper,
+                                       const int ref_factor,
+                                       const int vdim)
+{
+   int max_order = fes->GetMaxElementOrder();
+   PLBound plb(fes, ref_factor*(max_order+1));
+   GetElementBounds(plb, lower, upper, vdim);
+   return plb;
+}
+
+PLBound GridFunction::GetBounds(Vector &lower, Vector &upper,
+                                const int ref_factor, const int vdim)
+{
+   int max_order = fes->GetMaxElementOrder();
+   PLBound plb(fes, ref_factor*(max_order+1));
+   Vector lel, uel;
+   GetElementBounds(plb, lel, uel, vdim);
+
+   int nel  = fes->GetNE();
+   int fes_dim  = fes->GetVDim();
+   lower.SetSize(vdim > 0 ? 1 : fes_dim);
+   upper.SetSize(vdim > 0 ? 1 : fes_dim);
+   for (int d = 0; d < fes_dim; d++)
+   {
+      if (vdim > 0 && d != vdim-1) { continue; }
+      const int d_off = vdim > 0 ? 0 : d;
+      Vector lelt(lel, d_off*nel, nel);
+      Vector uelt(uel, d_off*nel, nel);
+      lower(d_off) = lelt.Min();
+      upper(d_off) = uelt.Max();
+   }
+   return plb;
+}
+
+}
+
+
